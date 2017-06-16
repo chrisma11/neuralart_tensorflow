@@ -3,142 +3,152 @@ import numpy as np
 import scipy.io
 import scipy.misc
 import os
+import time
 
-
-IMAGE_W = 800 
-IMAGE_H = 600 
-CONTENT_IMG =  './images/Taipei101.jpg'
-STYLE_IMG = './images/StarryNight.jpg'
+CONTENT_IMG = './images/harvard.jpg'
+STYLE_IMG = './images/starry_night.jpg'
 OUTOUT_DIR = './results'
 OUTPUT_IMG = 'results.png'
 VGG_MODEL = 'imagenet-vgg-verydeep-19.mat'
-INI_NOISE_RATIO = 0.7
+# Noise ratio of the initial input image
+NOISE_RATIO = 0.6
+# The emphasis put on style loss in relation to content loss in total loss computation
 STYLE_STRENGTH = 500
-ITERATION = 5000
+ITERATION = 1000
 
-CONTENT_LAYERS =[('conv4_2',1.)]
-STYLE_LAYERS=[('conv1_1',1.),('conv2_1',1.),('conv3_1',1.),('conv4_1',1.),('conv5_1',1.)]
+# Fully-connected layers at the end are left out because we will not use them
+VGG19_LAYERS = [
+    'conv1_1', 'relu1_1', 'conv1_2', 'relu1_2', 'pool1',
+    'conv2_1', 'relu2_1', 'conv2_2', 'relu2_2', 'pool2',
+    'conv3_1', 'relu3_1', 'conv3_2', 'relu3_2', 'conv3_3', 'relu3_3', 'conv3_4', 'relu3_4', 'pool3',
+    'conv4_1', 'relu4_1', 'conv4_2', 'relu4_2', 'conv4_3', 'relu4_3', 'conv4_4', 'relu4_4', 'pool4',
+    'conv5_1', 'relu5_1', 'conv5_2', 'relu5_2', 'conv5_3', 'relu5_3', 'conv5_4', 'relu5_4', 'pool5'
+]
+# Layers that abstract content information
+CONTENT_LAYERS =['conv4_2']
+# Use the relation between these layers to represent style
+STYLE_LAYERS=['conv1_1','conv2_1','conv3_1','conv4_1','conv5_1']
+# Mean pixel value VGG used to train
+MEAN_VALUES = np.array([123.68, 116.779, 103.939]).reshape((1,1,1,3))
 
+def build_vgg19(data_path, shape):
+    """
+    Extract relevent layers and weights from the raw VGG19 model
+    """
+    data = scipy.io.loadmat(data_path)
+    weights = data['layers'][0]
+    current = tf.Variable(np.zeros(shape).astype('float32'))
+    net = {'input': current}
+    for i in range(len(VGG19_LAYERS)):
+        layer = VGG19_LAYERS[i]
+        if layer.startswith('conv'):
+            W, b = weights[i][0][0][0][0]
+            W = tf.constant(W)
+            b = b.reshape(-1)
+            conv = tf.nn.conv2d(current, W, strides=(1, 1, 1, 1), padding='SAME')
+            # combine conv layer and relu layer for simplicity
+            current = tf.nn.relu(tf.nn.bias_add(conv, b))
+        elif layer.startswith('pool'):
+            current = tf.nn.avg_pool(current, ksize=(1, 2, 2, 1), strides=(1, 2, 2, 1), padding='SAME')
+        net[layer] = current
+    return net
 
-MEAN_VALUES = np.array([123, 117, 104]).reshape((1,1,1,3))
+def blend_noise(content_img):
+    """
+    Returns a noise image intermixed with the content image
+    """
+    noise_img = np.random.uniform(-20, 20, content_img.shape).astype('float32')
+    output_image = NOISE_RATIO * noise_img + (1 - NOISE_RATIO) * content_img
+    return output_image
 
-def build_net(ntype, nin, nwb=None):
-  if ntype == 'conv':
-    return tf.nn.relu(tf.nn.conv2d(nin, nwb[0], strides=[1, 1, 1, 1], padding='SAME')+ nwb[1])
-  elif ntype == 'pool':
-    return tf.nn.avg_pool(nin, ksize=[1, 2, 2, 1],
-                  strides=[1, 2, 2, 1], padding='SAME')
+def content_loss(sess, content_img, model, layer):
+    sess.run([model['input'].assign(content_img)])
+    ref = model[layer]
+    val = sess.run(ref)
+    filter_s = val.shape[1] * val.shape[2]
+    filter_n = val.shape[3]
+    # loss is defined as 0.5 * tf.nn.l2_loss(ref - val) in the paper
+    loss = (1./(2 * filter_n * filter_s)) * tf.nn.l2_loss(ref - val)
+    return loss
 
-def get_weight_bias(vgg_layers, i,):
-  weights = vgg_layers[i][0][0][0][0][0]
-  weights = tf.constant(weights)
-  bias = vgg_layers[i][0][0][0][0][1]
-  bias = tf.constant(np.reshape(bias, (bias.size)))
-  return weights, bias
+def gram_matrix(ref, val, filter_s, filter_n):
+    """
+    The feature correlations are given by the Gram matrix, which is the
+    inner product between the vectorised feature map i and j in layer l
+    """
+    matrix = tf.reshape(ref, (filter_s,filter_n))
+    gram = tf.matmul(tf.transpose(matrix), matrix)
+    matrix_val = val.reshape(filter_s,filter_n)
+    gram_val = np.dot(matrix_val.T, matrix_val)
+    return gram, gram_val
 
-def build_vgg19(path):
-  net = {}
-  vgg_rawnet = scipy.io.loadmat(path)
-  vgg_layers = vgg_rawnet['layers'][0]
-  net['input'] = tf.Variable(np.zeros((1, IMAGE_H, IMAGE_W, 3)).astype('float32'))
-  net['conv1_1'] = build_net('conv',net['input'],get_weight_bias(vgg_layers,0))
-  net['conv1_2'] = build_net('conv',net['conv1_1'],get_weight_bias(vgg_layers,2))
-  net['pool1']   = build_net('pool',net['conv1_2'])
-  net['conv2_1'] = build_net('conv',net['pool1'],get_weight_bias(vgg_layers,5))
-  net['conv2_2'] = build_net('conv',net['conv2_1'],get_weight_bias(vgg_layers,7))
-  net['pool2']   = build_net('pool',net['conv2_2'])
-  net['conv3_1'] = build_net('conv',net['pool2'],get_weight_bias(vgg_layers,10))
-  net['conv3_2'] = build_net('conv',net['conv3_1'],get_weight_bias(vgg_layers,12))
-  net['conv3_3'] = build_net('conv',net['conv3_2'],get_weight_bias(vgg_layers,14))
-  net['conv3_4'] = build_net('conv',net['conv3_3'],get_weight_bias(vgg_layers,16))
-  net['pool3']   = build_net('pool',net['conv3_4'])
-  net['conv4_1'] = build_net('conv',net['pool3'],get_weight_bias(vgg_layers,19))
-  net['conv4_2'] = build_net('conv',net['conv4_1'],get_weight_bias(vgg_layers,21))
-  net['conv4_3'] = build_net('conv',net['conv4_2'],get_weight_bias(vgg_layers,23))
-  net['conv4_4'] = build_net('conv',net['conv4_3'],get_weight_bias(vgg_layers,25))
-  net['pool4']   = build_net('pool',net['conv4_4'])
-  net['conv5_1'] = build_net('conv',net['pool4'],get_weight_bias(vgg_layers,28))
-  net['conv5_2'] = build_net('conv',net['conv5_1'],get_weight_bias(vgg_layers,30))
-  net['conv5_3'] = build_net('conv',net['conv5_2'],get_weight_bias(vgg_layers,32))
-  net['conv5_4'] = build_net('conv',net['conv5_3'],get_weight_bias(vgg_layers,34))
-  net['pool5']   = build_net('pool',net['conv5_4'])
-  return net
+def style_loss(sess, style_img, model, layer):
+    sess.run([model['input'].assign(style_img)])
+    ref = model[layer]
+    val = sess.run(ref)
+    filter_s = val.shape[1] * val.shape[2]
+    filter_n = val.shape[3]
+    G, A = gram_matrix(ref, val, filter_s, filter_n)
+    loss = (1./(4 * filter_s**2 * filter_n**2)) * tf.nn.l2_loss(G - A)
+    return loss
 
-def build_content_loss(p, x):
-  M = p.shape[1]*p.shape[2]
-  N = p.shape[3]
-  loss = (1./(2* N**0.5 * M**0.5 )) * tf.reduce_sum(tf.pow((x - p),2))  
-  return loss
+def read_images(content, style):
+    """
+    Returns processed content image and style image
+    """
+    content_img = scipy.misc.imread(content).astype(np.float)
+    target_shape = content_img.shape
+    # resize style image to fit the content image
+    style_img = scipy.misc.imread(style).astype(np.float)
+    style_img = scipy.misc.imresize(style_img, (target_shape[0], target_shape[1]))
+    # add an extra dimension
+    content_img = np.reshape(content_img, ((1,) + target_shape)) - MEAN_VALUES
+    style_img = np.reshape(style_img, ((1,) + target_shape)) - MEAN_VALUES
+    
+    return content_img, style_img
 
-
-def gram_matrix(x, area, depth):
-  x1 = tf.reshape(x,(area,depth))
-  g = tf.matmul(tf.transpose(x1), x1)
-  return g
-
-def gram_matrix_val(x, area, depth):
-  x1 = x.reshape(area,depth)
-  g = np.dot(x1.T, x1)
-  return g
-
-def build_style_loss(a, x):
-  M = a.shape[1]*a.shape[2]
-  N = a.shape[3]
-  A = gram_matrix_val(a, M, N )
-  G = gram_matrix(x, M, N )
-  loss = (1./(4 * N**2 * M**2)) * tf.reduce_sum(tf.pow((G - A),2))
-  return loss
-
-
-
-def read_image(path):
-  image = scipy.misc.imread(path)
-  image = image[np.newaxis,:IMAGE_H,:IMAGE_W,:] 
-  image = image - MEAN_VALUES
-  return image
-
-def write_image(path, image):
-  image = image + MEAN_VALUES
-  image = image[0]
-  image = np.clip(image, 0, 255).astype('uint8')
-  scipy.misc.imsave(path, image)
-
+def save_image(path, image):
+    image = image + MEAN_VALUES
+    image = np.clip(image[0], 0, 255).astype('uint8')
+    scipy.misc.imsave(path, image)
 
 def main():
-  net = build_vgg19(VGG_MODEL)
-  sess = tf.Session()
-  sess.run(tf.initialize_all_variables())
-  noise_img = np.random.uniform(-20, 20, (1, IMAGE_H, IMAGE_W, 3)).astype('float32')
-  content_img = read_image(CONTENT_IMG)
-  style_img = read_image(STYLE_IMG)
+    
+    if not os.path.exists(OUTOUT_DIR):
+        os.mkdir(OUTOUT_DIR)
+    
+    content_img, style_img = read_images(CONTENT_IMG, STYLE_IMG)
+    
+    net = build_vgg19(VGG_MODEL, content_img.shape)
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+    
+    # sum of content/style losses of every layers
+    cost_content = sum(map(lambda l: content_loss(sess, content_img, net, l), CONTENT_LAYERS))
+    cost_style = sum(map(lambda l: style_loss(sess, style_img, net, l), STYLE_LAYERS))
 
-  sess.run([net['input'].assign(content_img)])
-  cost_content = sum(map(lambda l,: l[1]*build_content_loss(sess.run(net[l[0]]) ,  net[l[0]])
-    , CONTENT_LAYERS))
-
-  sess.run([net['input'].assign(style_img)])
-  cost_style = sum(map(lambda l: l[1]*build_style_loss(sess.run(net[l[0]]) ,  net[l[0]])
-    , STYLE_LAYERS))
-
-  cost_total = cost_content + STYLE_STRENGTH * cost_style
-  optimizer = tf.train.AdamOptimizer(2.0)
-
-  train = optimizer.minimize(cost_total)
-  sess.run(tf.initialize_all_variables())
-  sess.run(net['input'].assign( INI_NOISE_RATIO* noise_img + (1.-INI_NOISE_RATIO) * content_img))
-
-  if not os.path.exists(OUTOUT_DIR):
-      os.mkdir(OUTOUT_DIR)
-
-  for i in range(ITERATION):
-    sess.run(train)
-    if i%100 ==0:
-      result_img = sess.run(net['input'])
-      print sess.run(cost_total)
-      write_image(os.path.join(OUTOUT_DIR,'%s.png'%(str(i).zfill(4))),result_img)
+    cost_total = cost_content + STYLE_STRENGTH * cost_style
   
-  write_image(os.path.join(OUTOUT_DIR,OUTPUT_IMG),result_img)
-  
+    train_step = tf.train.AdamOptimizer(2.).minimize(cost_total)
+
+    sess.run(tf.global_variables_initializer())
+    sess.run(net['input'].assign(blend_noise(content_img)))
+
+    for i in range(ITERATION):
+        sess.run(train_step)
+        print 'Iteration %d' % i
+        if i % 200 ==0:
+            result_img = sess.run(net['input'])
+            print 'cost:', sess.run(cost_total)
+            save_image(os.path.join(OUTOUT_DIR,'%d.png'%i),result_img)
+    
+    sess.close()
+    
+    output_path = os.path.join(OUTOUT_DIR,OUTPUT_IMG)
+    save_image(output_path, result_img)
+
 
 if __name__ == '__main__':
-  main()
+    start_time = time.clock()
+    main()
+    print("-- %s seconds --" % (time.clock() - start_time))
